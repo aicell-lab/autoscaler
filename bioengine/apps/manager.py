@@ -2578,12 +2578,11 @@ class AppsManager:
             # source. Clear is_deployed so the monitor loop doesn't fire a
             # redundant redeploy during the delete→rebuild window.
             #
-            # This runs AFTER the build, not before it, because only the build
-            # resolves the request to a concrete version and fingerprints the
-            # files it actually synced. Comparing the raw request instead means
-            # deploy_app(version=None) — which inherits the old pin above —
-            # always looks unchanged, and a re-staged version always looks
-            # unchanged. It stays BEFORE _check_resources so the old app's
+            # This runs AFTER the build because only the build fingerprints the
+            # files it actually synced. A version string cannot see content that
+            # changed underneath it, so a re-staged version took the in-place
+            # serve.run path while _ensure_source had already refreshed the
+            # source on disk. It stays BEFORE _check_resources so the old app's
             # reservation is already released when free capacity is measured.
             if is_update:
                 new_signature = app.metadata.get("source_signature")
