@@ -1,0 +1,13 @@
+bioio>=3.5.0
+bioio-czi>=2.9.0
+fastapi>=0.115
+fsspec>=2024.9.0
+httpx[http2]>=0.28
+imagecodecs>=2025.3.30
+numcodecs>=0.13,<0.14
+numpy>=1.26
+pillow>=10.0
+pyyaml>=6.0
+tifffile>=2025.5.10
+uvicorn>=0.30
+zarr>=2.18,<3
