@@ -81,8 +81,10 @@ DISCONNECTED = ("client disconnected", "connection closed", "connection is close
 
 
 def is_disconnect(error: Exception) -> bool:
+    # TimeoutError is not a disconnect but is the same problem for a caller: the
+    # reply never arrived and the handle has to be re-resolved to find out why.
     message = str(error).lower()
-    return isinstance(error, ConnectionError) or any(m in message for m in DISCONNECTED)
+    return isinstance(error, (ConnectionError, TimeoutError)) or any(m in message for m in DISCONNECTED)
 
 
 class SiteHandle:
@@ -94,25 +96,42 @@ class SiteHandle:
     seconds and the run died three hours in, because every handle was resolved
     once at startup and held for the next twenty-three hours. Re-resolving is the
     only recovery, so it happens here rather than being left to the caller.
+
+    The same day it also died on a plain TimeoutError, during a websocket storm
+    that closed and reopened the connection fifty-six times in a minute. The
+    handle treats a reply that never arrived the same way however it failed to
+    arrive, because from here the two are indistinguishable.
     """
 
-    def __init__(self, server, worker_prefix: str, application_id: str, attempts: int = 4) -> None:
+    def __init__(self, server, worker_prefix: str, application_id: str, attempts: int = 5) -> None:
         self._server = server
         self._worker_prefix = worker_prefix
         self._application_id = application_id
         self._service = None
+        self._floor = 0
         self.attempts = attempts
 
     async def connect(self) -> Dict[str, Any]:
         self._service, record = await resolve(self._server, self._worker_prefix, self._application_id)
         return record
 
-    async def _already_trained(self, tag: str):
-        """The site's own record for ``tag``, if the lost response had landed."""
-        for record in reversed(await self.get_history()):
-            if record.get("tag") == tag:
-                return record
-        return None
+    async def _already_trained(self, tag: str, wait: float = 120.0):
+        """The site's own record for ``tag``, waiting out a call that may still be running.
+
+        A timeout cancels nothing at the far end, and the site serialises train
+        behind a lock — so a retry issued while the first call is still going
+        does not race it, it queues behind it and the round runs twice. Rounds
+        take seconds and the timeout is far longer, so anything still running
+        lands well inside this window; a call that really did die never appears.
+        """
+        deadline = time.monotonic() + wait
+        while True:
+            for record in reversed((await self.get_history())[self._floor:]):
+                if record.get("tag") == tag:
+                    return record
+            if time.monotonic() >= deadline:
+                return None
+            await asyncio.sleep(5.0)
 
     def __getattr__(self, method: str):
         if method.startswith("__"):
@@ -121,13 +140,20 @@ class SiteHandle:
         async def call(*args, **kwargs):
             for attempt in range(self.attempts):
                 try:
-                    return await getattr(self._service, method)(*args, **kwargs)
+                    result = await getattr(self._service, method)(*args, **kwargs)
+                    if method == "pull_weights":
+                        # Every arm starts by pulling weights, and the site keeps
+                        # its history across arms and across driver processes — so
+                        # a resumed run re-uses tags that are already in it. Only
+                        # rounds recorded after this point belong to this arm.
+                        self._floor = (await self.get_status())["history_entries"]
+                    return result
                 except Exception as error:
                     if attempt == self.attempts - 1 or not is_disconnect(error):
                         raise
                     delay = 5.0 * 3**attempt
                     print(
-                        f"{self._application_id}.{method} lost its connection "
+                        f"{self._application_id}.{method} never got its reply "
                         f"({type(error).__name__}: {error}), re-resolving in {delay:.0f}s "
                         f"[{attempt + 1}/{self.attempts - 1}]",
                         flush=True,
