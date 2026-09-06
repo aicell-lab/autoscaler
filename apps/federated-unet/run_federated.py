@@ -366,6 +366,44 @@ async def federated_arm(
     }
 
 
+PRELIMINARY = (
+    "PRELIMINARY: one seed of a multi-seed run, written the moment the arm finished. "
+    "The pre-registered verdicts are defined over all seeds and none of them can be "
+    "read off this file."
+)
+
+
+async def score_arm(
+    apps, run_artifact_id: str, eval_sites, out_dir: Path, prefix: str, arm: str,
+    record: Dict[str, Any], previews: bool,
+) -> Dict[str, float]:
+    """Score one finished arm on every domain's held-out test split and write it out.
+
+    Written per arm rather than per seed so a reader has figure-usable material
+    while the run is still going. Per-image scores are kept, not just the mean,
+    and the file says in its first field that one seed decides nothing.
+    """
+    record["evaluation"] = {}
+    for name in sorted(set(eval_sites.values())):
+        await apps[name].pull_weights(run_artifact_id=run_artifact_id, path=record["checkpoint"])
+        record["evaluation"][name] = await apps[name].evaluate(split="test")
+        if previews:
+            status = await apps[name].get_status()
+            for dataset in status["datasets_loaded"]:
+                preview = await apps[name].preview(dataset=dataset, split="test", n=3)
+                (out_dir / f"preview_{prefix}_{arm}_{name}_{dataset}.png").write_bytes(
+                    base64.b64decode(preview["png_base64"])
+                )
+    (out_dir / f"arm_{prefix}_{arm}.json").write_text(
+        json.dumps({"status": PRELIMINARY, "seed": prefix, "arm": arm, **record}, indent=2)
+    )
+    return {
+        dataset: round(scores["dice_mean"], 4)
+        for site in record["evaluation"].values()
+        for dataset, scores in site.items()
+    }
+
+
 def resolve_pre_registration(path: str) -> dict:
     """Pin the commit that holds this run's predictions, refusing an unstaged one.
 
@@ -535,6 +573,10 @@ async def main() -> None:
                 apps, store, run_artifact_id, participants,
                 scored_on, prefix, arm, args, seed, weighting,
             )
+            summary = await score_arm(
+                apps, run_artifact_id, eval_sites, out_dir, prefix, arm, arms[arm], args.previews
+            )
+            print(f"  {arm} test dice: {summary}", flush=True)
             flush()
 
         # --- Arm: federated, every client -----------------------------------
@@ -593,34 +635,22 @@ async def main() -> None:
                 f"{arms[arm]['convergence_round']}",
                 flush=True,
             )
-            flush()
-
-        # --- Evaluation: every arm, on both sites' held-out test splits -----
-        for arm, record in arms.items():
-            if "evaluation" in record:
-                continue
-            record["evaluation"] = {}
-            for name in sorted(set(eval_sites.values())):
-                await apps[name].pull_weights(run_artifact_id=run_artifact_id, path=record["checkpoint"])
-                record["evaluation"][name] = await apps[name].evaluate(split="test")
-            summary = {
-                dataset: round(scores["dice_mean"], 4)
-                for site in record["evaluation"].values()
-                for dataset, scores in site.items()
-            }
+            summary = await score_arm(
+                apps, run_artifact_id, eval_sites, out_dir, prefix, arm, arms[arm], args.previews
+            )
             print(f"  {arm} test dice: {summary}", flush=True)
             flush()
 
-        if args.previews:
-            for name in sorted(set(eval_sites.values())):
-                for arm in arms:
-                    await apps[name].pull_weights(run_artifact_id=run_artifact_id, path=arms[arm]["checkpoint"])
-                    status = await apps[name].get_status()
-                    for dataset in status["datasets_loaded"]:
-                        preview = await apps[name].preview(dataset=dataset, split="test", n=3)
-                        (out_dir / f"preview_{prefix}_{arm}_{name}_{dataset}.png").write_bytes(
-                            base64.b64decode(preview["png_base64"])
-                        )
+        # Arms restored from a run that predates per-arm scoring.
+        for arm, record in arms.items():
+            if "evaluation" in record:
+                continue
+            summary = await score_arm(
+                apps, run_artifact_id, eval_sites, out_dir, prefix, arm, record, args.previews
+            )
+            print(f"  {arm} test dice: {summary}", flush=True)
+            flush()
+
 
     transport = {name: await app.get_transport_log() for name, app in apps.items()}
     transport["driver"] = driver_log.dump()

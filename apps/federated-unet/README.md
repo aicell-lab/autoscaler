@@ -370,8 +370,17 @@ python run_federated.py --layout acquisition-4site \
 which writes `metrics.json`, `provenance.json` and `transport_audit.json` into
 `../bioengine-paper/analysis/results/federated-unet-<run-id>/`.
 
-`metrics.json` is rewritten after every arm, so a run that dies keeps everything
-that finished. To carry on, repeat the command with the *same* `--run-id` — the
+Each arm is scored on the held-out test splits and written out the moment it
+finishes, rather than at the end of its seed: `arm_seed_<n>_<arm>.json` (per-image
+test scores, the validation curve, the round records) and, with `--previews`, the
+`preview_seed_<n>_<arm>_*.png` panels. Those files are written once and never
+rewritten, and each one opens with a `status` field saying it is a single seed —
+a reader watching the directory gets usable material while the run is still
+going, without any of it being mistakable for a pre-registered verdict, which is
+defined over all five seeds.
+
+`metrics.json` accumulates the same records and is rewritten after every arm, so
+a run that dies keeps everything that finished. To carry on, repeat the command with the *same* `--run-id` — the
 round checkpoints have to still be reachable — and add `--resume`:
 
 ```bash
