@@ -157,7 +157,21 @@ def create_app(config_path: str | Path, public_url: Optional[str] = None) -> Fas
     )
 
     def base_url(request: Request) -> str:
-        return public_url or str(request.base_url).rstrip("/")
+        """Public root to advertise in zarr and Vizarr URLs.
+
+        Set OMEZARR_VIEW_PUBLIC_URL to pin it. Otherwise derive it from the
+        request, forcing https for any non-local host: the tunnel terminates
+        TLS and then forwards plain http, so ``x-forwarded-proto`` says
+        ``http`` even for an https client. Trusting it hands a browser an
+        http:// zarr URL, which it refuses as mixed content.
+        """
+        if public_url:
+            return public_url
+        root = str(request.base_url).rstrip("/")
+        host = request.headers.get("x-forwarded-host") or request.url.hostname or ""
+        if root.startswith("http://") and not host.startswith(("localhost", "127.")):
+            root = "https://" + root[len("http://"):]
+        return root
 
     def entry_or_404(dataset_id: str) -> DatasetEntry:
         entry = catalog.get(dataset_id)
@@ -298,8 +312,12 @@ def main() -> None:
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     config = os.getenv("OMEZARR_VIEW_CONFIG",
                        str(Path(__file__).resolve().parent.parent / "datasets.yaml"))
+    # Behind a tunnel/proxy the app must build its own public URLs from the
+    # forwarded headers, otherwise every zarr_url it hands out points at
+    # localhost and nothing outside the host can open the view.
     uvicorn.run(create_app(config), host="0.0.0.0",
-                port=int(os.getenv("PORT", "8842")), log_level="info")
+                port=int(os.getenv("PORT", "8842")), log_level="info",
+                proxy_headers=True, forwarded_allow_ips="*")
 
 
 if __name__ == "__main__":

@@ -19,10 +19,42 @@ from playwright.async_api import async_playwright
 VIZARR = "https://hms-dbmi.github.io/vizarr/"
 
 
-async def shoot(base: str, dataset: str, out_dir: Path, timeout_s: int = 120) -> dict:
+def _ink(path: Path) -> dict:
+    """Fraction of the canvas that is not black.
+
+    A screenshot cannot distinguish 'rendered' from 'failed' on its own —
+    Vizarr paints a black canvas just as happily for a view that never
+    delivered a tile, and during development it did exactly that three times
+    for three different reasons. Counting lit pixels is the actual evidence.
+    """
+    from PIL import Image
+
+    img = Image.open(path).convert("L")
+    # Ignore the control panel in the top-left corner.
+    w, h = img.size
+    img = img.crop((int(w * 0.25), 0, w, h))
+    hist = img.histogram()
+    total = sum(hist)
+    lit = sum(hist[12:])
+    return {"lit_fraction": round(lit / total, 4), "pixels": total}
+
+
+async def shoot(base: str, dataset: str, out_dir: Path, timeout_s: int = 120,
+                warm: bool = True) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
     source = f"{base}/zarr/{dataset}"
     url = f"{VIZARR}?source={source}"
+
+    warm_seconds = None
+    if warm:
+        # Build the view first. A cold deep pyramid takes tens of seconds to
+        # index, and screenshotting during that measures the build, not the
+        # render.
+        import httpx
+
+        t0 = time.perf_counter()
+        httpx.get(f"{base}/api/datasets/{dataset}", timeout=timeout_s * 2)
+        warm_seconds = round(time.perf_counter() - t0, 2)
     calls: list[dict] = []
     errors: list[str] = []
 
@@ -80,17 +112,21 @@ async def shoot(base: str, dataset: str, out_dir: Path, timeout_s: int = 120) ->
 
     chunks = [c for c in calls if not c["key"].endswith((".zarray", ".zattrs", ".zgroup"))]
     ok = [c for c in chunks if c["status"] == 200]
+    ink = _ink(shot)
     return {
         "dataset": dataset,
         "vizarr_url": url,
         "screenshot": str(shot),
+        "warm_build_seconds": warm_seconds,
         "seconds_to_first_chunk_request": round(first_chunk_at, 2) if first_chunk_at else None,
         "metadata_requests": [c for c in calls if c not in chunks],
         "chunk_requests": len(chunks),
         "chunk_requests_ok": len(ok),
         "chunk_statuses": sorted({c["status"] for c in chunks}),
+        "canvas": ink,
         "page_errors": errors[:10],
-        "rendered": bool(ok),
+        # Both halves are required: tiles arrived AND the canvas is lit.
+        "rendered": bool(ok) and ink["lit_fraction"] > 0.005,
     }
 
 
