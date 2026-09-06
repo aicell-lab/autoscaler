@@ -247,6 +247,15 @@ function mappingList(d) {
   return `<ul class="map">${yes.join("")}${no.join("")}</ul>`;
 }
 
+function captionBlock(d) {
+  // Generated prose, quoted verbatim in figure captions — shown here so what
+  // the paper says and what the server did cannot drift apart.
+  if (!d.caption) return "";
+  const parts = [d.caption.access, d.caption.mapped, d.caption.not_mapped]
+    .filter(Boolean).map((t) => `<p style="margin:0 0 8px">${t}</p>`).join("");
+  return `<div style="border-left:2px solid var(--line);padding-left:12px;margin-bottom:12px">${parts}</div>`;
+}
+
 function timingList(d) {
   const t = d.build_timings_s;
   if (!t) return "";
@@ -333,7 +342,8 @@ function card(d) {
     buildBtn.textContent = "Rebuild";
     buildBtn.disabled = false;
     detailsEl.hidden = false;
-    el.querySelector("[data-inner]").innerHTML = timingList(d) + mappingList(d);
+    el.querySelector("[data-inner]").innerHTML =
+      captionBlock(d) + timingList(d) + mappingList(d);
     const thumb = el.querySelector("[data-thumb]");
     const img = new Image();
     img.onload = () => { thumb.querySelector(".ph")?.remove(); thumb.prepend(img); };

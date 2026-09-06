@@ -67,6 +67,55 @@ class MetadataMapping:
     def as_dict(self) -> Dict[str, Any]:
         return {"mapped": self.mapped, "not_mapped": self.unmapped}
 
+    def as_sentences(self) -> Dict[str, str]:
+        """Render the mapping as prose meant to be quoted verbatim.
+
+        Figure captions quote this rather than paraphrasing it, so it has to
+        read as English and it has to stay generated — a paraphrase drifts from
+        what the code actually mapped, which is the whole failure this guards.
+        """
+        mapped_parts: List[str] = []
+        dims = self.mapped.get("dimensions")
+        if dims:
+            inner = ", ".join(f"{a} {n}" for a, n in dims.items())
+            mapped_parts.append(f"dimensions ({inner})")
+        sizes = self.mapped.get("physical_pixel_sizes")
+        if sizes:
+            inner = ", ".join(
+                f"{a} {v['size']:g} {'µm' if v['unit'] == 'micrometer' else (v['unit'] or 'units')}"
+                for a, v in sizes.items())
+            mapped_parts.append(f"physical pixel sizes ({inner})")
+        names = [n for n in (self.mapped.get("channel_names") or []) if n]
+        if names:
+            mapped_parts.append(
+                f"{len(names)} channel name{'s' if len(names) != 1 else ''} "
+                f"({', '.join(names)})")
+        dtype = self.mapped.get("dtype")
+        if dtype:
+            import numpy as _np
+            try:
+                dtype = _np.dtype(dtype).name
+            except TypeError:
+                pass
+            mapped_parts.append(f"data type {dtype}")
+        levels = self.mapped.get("pyramid_levels")
+        if levels:
+            mapped_parts.append(
+                f"{levels} pyramid level{'s' if levels != 1 else ''} with their "
+                "true scale factors" if levels > 1 else "a single resolution level")
+        if self.mapped.get("acquisition_date"):
+            mapped_parts.append(f"acquisition date {self.mapped['acquisition_date']}")
+
+        # Drop the parenthetical reason; the caption states the fact, and the
+        # reason lives in the dataset's own record.
+        unmapped_parts = [m.split(":", 1)[0] for m in self.unmapped]
+
+        mapped = ("Mapped from the source: " + "; ".join(mapped_parts) + "."
+                  if mapped_parts else "Nothing could be mapped from the source.")
+        not_mapped = ("Not mapped: " + "; ".join(unmapped_parts) + "."
+                      if unmapped_parts else "Everything the source declares is mapped.")
+        return {"mapped": mapped, "not_mapped": not_mapped}
+
 
 def from_ome_xml(
     ome_xml: Optional[str],
@@ -82,7 +131,9 @@ def from_ome_xml(
     image = ElementTree.fromstring(ome_xml).find(f"{OME_NS}Image")
     if image is None:
         return md
-    md.acquisition_date = image.get("AcquisitionDate")
+    acquired = image.find(f"{OME_NS}AcquisitionDate")
+    if acquired is not None and acquired.text:
+        md.acquisition_date = acquired.text.strip()
     pixels = image.find(f"{OME_NS}Pixels")
     if pixels is None:
         return md
@@ -181,7 +232,8 @@ def build_ngff_attrs(md: SourceMetadata) -> Tuple[Dict[str, Any], MetadataMappin
             mapping.miss("channel names", "not declared in the source")
         # Colours and display windows are absent from most acquisition files;
         # a synthesised default is a rendering hint, not source metadata.
-        mapping.miss("channel colors", "not declared in the source; view assigns defaults")
+        mapping.miss("channel colours",
+                     "not declared in the source; view assigns defaults")
         mapping.miss("display windows (contrast limits)",
                      "not declared in the source; view assigns full dtype range")
         window = _dtype_window(md.dtype)

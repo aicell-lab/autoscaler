@@ -285,6 +285,18 @@ class ReferenceView(BaseView):
             "build_timings_s": {k: round(v, 3) for k, v in self.build_timings.items()},
             "direct_client_access": True,
             "metadata_mapping": self.mapping.as_dict(),
+            "caption": {
+                "access": (
+                    "Served as a lazy OME-Zarr view over the original "
+                    f"{self.compression.split('.')[-1].lower()}-compressed TIFF; "
+                    "the file was not converted or copied. The view is a "
+                    "byte-offset index, so a client holding it reads the "
+                    "original file directly and the server is not in the data "
+                    "path (zero-copy). Browsers cannot decode the source codec, "
+                    "so the HTTP endpoint they use transcodes each chunk to "
+                    "zlib and is not zero-copy."),
+                **self.mapping.as_sentences(),
+            },
         }
 
 
@@ -412,6 +424,15 @@ class BioIOView(BaseView):
             "direct_client_access": False,
             "chunk_semantics": "one YX plane per chunk (the reader's own granularity)",
             "metadata_mapping": self.mapping.as_dict(),
+            "caption": {
+                "access": (
+                    "Served as a lazy OME-Zarr view read through BioIO; the "
+                    "file was not converted or copied. This format has no "
+                    "chunk layout that can be addressed as byte ranges, so "
+                    "there is no zero-copy tier: every read goes through the "
+                    "server, one image plane at a time."),
+                **self.mapping.as_sentences(),
+            },
         }
 
 
