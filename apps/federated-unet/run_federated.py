@@ -76,6 +76,77 @@ async def resolve(server, worker_prefix: str, application_id: str):
     return await server.get_service(record["service_ids"]["websocket_service_id"]), record
 
 
+DISCONNECTED = ("client disconnected", "connection closed", "connection is closed",
+                "connection lost", "service not found")
+
+
+def is_disconnect(error: Exception) -> bool:
+    message = str(error).lower()
+    return isinstance(error, ConnectionError) or any(m in message for m in DISCONNECTED)
+
+
+class SiteHandle:
+    """An app handle that survives its replica's Hypha client being recycled.
+
+    A Hypha service proxy is pinned to the client id it was resolved against, so
+    once that client goes away the handle is dead for good even though the app
+    itself is fine. On 2026-09-06 a replica's websocket was recycled for thirteen
+    seconds and the run died three hours in, because every handle was resolved
+    once at startup and held for the next twenty-three hours. Re-resolving is the
+    only recovery, so it happens here rather than being left to the caller.
+    """
+
+    def __init__(self, server, worker_prefix: str, application_id: str, attempts: int = 4) -> None:
+        self._server = server
+        self._worker_prefix = worker_prefix
+        self._application_id = application_id
+        self._service = None
+        self.attempts = attempts
+
+    async def connect(self) -> Dict[str, Any]:
+        self._service, record = await resolve(self._server, self._worker_prefix, self._application_id)
+        return record
+
+    async def _already_trained(self, tag: str):
+        """The site's own record for ``tag``, if the lost response had landed."""
+        for record in reversed(await self.get_history()):
+            if record.get("tag") == tag:
+                return record
+        return None
+
+    def __getattr__(self, method: str):
+        if method.startswith("__"):
+            raise AttributeError(method)
+
+        async def call(*args, **kwargs):
+            for attempt in range(self.attempts):
+                try:
+                    return await getattr(self._service, method)(*args, **kwargs)
+                except Exception as error:
+                    if attempt == self.attempts - 1 or not is_disconnect(error):
+                        raise
+                    delay = 5.0 * 3**attempt
+                    print(
+                        f"{self._application_id}.{method} lost its connection "
+                        f"({type(error).__name__}: {error}), re-resolving in {delay:.0f}s "
+                        f"[{attempt + 1}/{self.attempts - 1}]",
+                        flush=True,
+                    )
+                    await asyncio.sleep(delay)
+                    await self.connect()
+                    # train is the only call whose blind retry would double a
+                    # site's optimiser steps, and equal compute per arm is what
+                    # the whole comparison rests on. The site's history says
+                    # whether the call landed before the response was lost.
+                    if method == "train":
+                        done = await self._already_trained(kwargs.get("tag", ""))
+                        if done is not None:
+                            print(f"  {self._application_id}: {done['tag']} had already run", flush=True)
+                            return done
+
+        return call
+
+
 def load_state_dict(payload: bytes) -> Dict[str, torch.Tensor]:
     return torch.load(io.BytesIO(payload), map_location="cpu", weights_only=True)
 
@@ -173,7 +244,11 @@ async def val_dice(apps, names) -> Tuple[Dict[str, float], Dict[str, str]]:
 async def train_arm(
     app, apps, instance: str, rounds: int, steps: int, lr: float, seed: int, tag: str
 ) -> List[Dict]:
-    """Run rounds x steps of purely local training, scoring validation each round."""
+    """Run rounds x steps of purely local training, scoring validation each round.
+
+    ``tag`` must be unique within a run: a reconnecting handle uses it to tell a
+    round that already ran from one that has to be repeated.
+    """
     history = []
     for r in range(rounds):
         record = await app.train(steps=steps, lr=lr, seed=seed * 1000 + r, tag=f"{tag}/r{r:02d}")
@@ -211,7 +286,8 @@ async def federated_arm(
         local = await asyncio.gather(
             *(
                 apps[name].train(
-                    steps=args.steps, lr=args.lr, seed=seed * 1000 + r, tag=f"{arm}/r{r:02d}"
+                    steps=args.steps, lr=args.lr, seed=seed * 1000 + r,
+                    tag=f"{prefix}/{arm}/r{r:02d}",
                 )
                 for name in participants
             )
@@ -345,6 +421,12 @@ async def main() -> None:
         default=None,
         help="Path to a design file whose predictions must already be committed",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Keep the arms already in the output metrics.json and run only the missing ones "
+             "(pass the same --run-id, so the round checkpoints are still reachable)",
+    )
     args = parser.parse_args()
 
     pre_registration = resolve_pre_registration(args.pre_registration)
@@ -375,7 +457,8 @@ async def main() -> None:
     servers, apps, app_records = {}, {}, {}
     for name, spec in sites.items():
         servers[name] = await connect_to_server({"server_url": SERVER_URL, "token": env[spec["token_key"]]})
-        apps[name], app_records[name] = await resolve(servers[name], spec["worker"], spec["application_id"])
+        apps[name] = SiteHandle(servers[name], spec["worker"], spec["application_id"])
+        app_records[name] = await apps[name].connect()
         print(f"{name}: resolved {spec['application_id']}", flush=True)
 
     site_status = {name: await app.get_status() for name, app in apps.items()}
@@ -417,7 +500,15 @@ async def main() -> None:
     eval_sites = {dataset: names[0] for dataset, names in holders.items()}
     print(f"scoring each domain on: {eval_sites}", flush=True)
 
-    results: Dict[str, Any] = {}
+    metrics_path = out_dir / "metrics.json"
+    # Flushed per arm rather than per seed: the run that motivated this lost
+    # five completed arms because it died in the sixth, and an arm is the
+    # largest unit that is worth nothing until it finishes.
+    results: Dict[str, Any] = json.loads(metrics_path.read_text()) if args.resume and metrics_path.exists() else {}
+
+    def flush() -> None:
+        metrics_path.write_text(json.dumps(results, indent=2))
+
     for seed in args.seeds:
         print(f"\n=== seed {seed} ===", flush=True)
         prefix = f"seed_{seed}"
@@ -433,14 +524,18 @@ async def main() -> None:
             await apps[name].pull_weights(run_artifact_id=run_artifact_id, path=f"{prefix}/init.pt")
         print(f"init: {init['n_parameters']} params, sha256 {init_entry['sha256'][:12]}", flush=True)
 
-        arms: Dict[str, Dict[str, Any]] = {}
+        arms: Dict[str, Dict[str, Any]] = results.setdefault(prefix, {})
         scored_on = sorted(set(eval_sites.values()))
 
         async def fed(arm: str, participants: List[str], weighting: str) -> None:
+            if arm in arms:
+                print(f"  {arm}: kept from {metrics_path}", flush=True)
+                return
             arms[arm] = await federated_arm(
                 apps, store, run_artifact_id, participants,
                 scored_on, prefix, arm, args, seed, weighting,
             )
+            flush()
 
         # --- Arm: federated, every client -----------------------------------
         await fed("fedavg", clients, "sample-count")
@@ -465,10 +560,14 @@ async def main() -> None:
         # --- Arms: single-site and pooled ----------------------------------
         single_site_arms = [(f"{name}-only", name) for name in clients]
         for arm, instance in single_site_arms + [("pooled", "pooled")]:
+            if arm in arms:
+                print(f"  {arm}: kept from {metrics_path}", flush=True)
+                continue
             started = time.time()
             await apps[instance].pull_weights(run_artifact_id=run_artifact_id, path=f"{prefix}/init.pt")
             history = await train_arm(
-                apps[instance], apps, instance, args.rounds, args.steps, args.lr, seed, arm
+                apps[instance], apps, instance, args.rounds, args.steps, args.lr, seed,
+                f"{prefix}/{arm}",
             )
             await apps[instance].push_weights(
                 run_artifact_id=run_artifact_id, path=f"{prefix}/arms/{arm}.pt", note=f"{arm} final"
@@ -494,9 +593,12 @@ async def main() -> None:
                 f"{arms[arm]['convergence_round']}",
                 flush=True,
             )
+            flush()
 
         # --- Evaluation: every arm, on both sites' held-out test splits -----
         for arm, record in arms.items():
+            if "evaluation" in record:
+                continue
             record["evaluation"] = {}
             for name in sorted(set(eval_sites.values())):
                 await apps[name].pull_weights(run_artifact_id=run_artifact_id, path=record["checkpoint"])
@@ -507,11 +609,7 @@ async def main() -> None:
                 for dataset, scores in site.items()
             }
             print(f"  {arm} test dice: {summary}", flush=True)
-
-        results[f"seed_{seed}"] = arms
-        # Flushed per seed: a transient transport failure on seed 4 should cost
-        # one seed, not the four that already finished.
-        (out_dir / "metrics.json").write_text(json.dumps(results, indent=2))
+            flush()
 
         if args.previews:
             for name in sorted(set(eval_sites.values())):
@@ -591,7 +689,7 @@ async def main() -> None:
         ),
     }
 
-    (out_dir / "metrics.json").write_text(json.dumps(results, indent=2))
+    flush()
     (out_dir / "provenance.json").write_text(json.dumps(provenance, indent=2, default=str))
     (out_dir / "transport_audit.json").write_text(json.dumps(transport, indent=2, default=str))
     print(f"\nwrote {out_dir}", flush=True)
