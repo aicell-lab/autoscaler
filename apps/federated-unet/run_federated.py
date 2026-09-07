@@ -256,15 +256,31 @@ def convergence_round(curve: List[float], window: int = 5, tolerance: float = 0.
     return None
 
 
-async def val_dice(apps, names) -> Tuple[Dict[str, float], Dict[str, str]]:
-    """Mean validation Dice per dataset, plus the weights each site scored with."""
+async def val_dice(apps, names) -> Tuple[Dict[str, float], Dict[str, str], Dict[str, str]]:
+    """Mean validation Dice per dataset, the weights each site scored with, and
+    the site each dataset's score came from.
+
+    ``scores`` is keyed by dataset and ``scored_with`` by site — two key spaces
+    that look like one only because each consortium client happens to hold a
+    dataset named after it. ``scored_by`` carries the attribution as data, so no
+    consumer has to recover it from that coincidence, and the pooled arm (six
+    datasets, one scoring site) says so rather than reading as six sites.
+    """
     scores: Dict[str, float] = {}
     scored_with: Dict[str, str] = {}
+    scored_by: Dict[str, str] = {}
     for name in names:
         for dataset, result in (await apps[name].evaluate(split="val")).items():
+            if dataset in scored_by:
+                raise RuntimeError(
+                    f"dataset {dataset!r} was scored by both {scored_by[dataset]} and "
+                    f"{result['site']}; a dataset-keyed score map cannot hold both, and "
+                    f"silently keeping the last would attribute it to the wrong site"
+                )
             scores[dataset] = float(result["dice_mean"])
+            scored_by[dataset] = result["site"]
             scored_with[name] = result["weights_sha256"]
-    return scores, scored_with
+    return scores, scored_with, scored_by
 
 
 async def train_arm(
@@ -278,7 +294,7 @@ async def train_arm(
     history = []
     for r in range(rounds):
         record = await app.train(steps=steps, lr=lr, seed=seed * 1000 + r, tag=f"{tag}/r{r:02d}")
-        record["val_dice"], _ = await val_dice(apps, [instance])
+        record["val_dice"], _, record["scored_by"] = await val_dice(apps, [instance])
         history.append(record)
     return history
 
@@ -340,7 +356,7 @@ async def federated_arm(
         for name in dict.fromkeys([*participants, *eval_on]):
             await apps[name].pull_weights(run_artifact_id=run_artifact_id, path=global_path)
         # Scored after the merge and pull, so this is the aggregate's curve.
-        merged_val, scored_with = await val_dice(apps, eval_on)
+        merged_val, scored_with, scored_by = await val_dice(apps, eval_on)
         # A site whose weights did not move while the aggregate did was scored on
         # stale weights. That failure produces plausible numbers instead of an
         # error — a LOSO fold's held-out client trains on nothing, so a missed
@@ -361,6 +377,7 @@ async def federated_arm(
                 "val_dice": merged_val,
                 "global_sha256": aggregate["sha256"],
                 "scored_with": scored_with,
+                "scored_by": scored_by,
             }
         )
         print(
