@@ -24,7 +24,6 @@ if TYPE_CHECKING:
 
 
 _datasets_singleton: Optional["BioEngineDatasets"] = None
-_logger_singleton: Optional[logging.Logger] = None
 
 
 def _get_datasets() -> "BioEngineDatasets":
@@ -65,25 +64,30 @@ def _get_datasets() -> "BioEngineDatasets":
 
 
 def _get_logger() -> logging.Logger:
-    """Return the process-local logger.
+    """Return the logger for the current process.
 
     Inside a Ray Serve replica the appropriate logger is ``ray.serve`` —
     Ray installs handlers that route logs into the replica log files.
-    Elsewhere we fall back to a plain ``bioengine.app`` logger.
-    """
-    global _logger_singleton
-    if _logger_singleton is not None:
-        return _logger_singleton
+    Elsewhere (notably the worker's introspection Ray task) we fall back to
+    ``bioengine.app``, configured on first use so the fallback is merely
+    degraded rather than silent: unconfigured, it inherits the root level of
+    ``WARNING`` and has no handler, so ``INFO`` records are dropped outright.
 
+    Deliberately not cached. ``BIOENGINE_REPLICA`` is only true once the
+    replica's environment is in place, and a cached fallback would outlive it.
+    """
     if os.environ.get("BIOENGINE_REPLICA") == "1":
-        _logger_singleton = logging.getLogger("ray.serve")
-    else:
-        _logger_singleton = logging.getLogger("bioengine.app")
-    return _logger_singleton
+        return logging.getLogger("ray.serve")
+
+    logger = logging.getLogger("bioengine.app")
+    if not logger.handlers:
+        from bioengine.utils import create_logger
+
+        logger = create_logger("bioengine.app")
+    return logger
 
 
 def _reset_for_tests() -> None:
-    """Drop cached singletons so tests can re-init under different env vars."""
-    global _datasets_singleton, _logger_singleton
+    """Drop the cached datasets so tests can re-init under different env vars."""
+    global _datasets_singleton
     _datasets_singleton = None
-    _logger_singleton = None
