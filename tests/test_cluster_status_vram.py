@@ -1,4 +1,4 @@
-"""Unit tests for the VRAM_MB reservation reported by ``get_cluster_status``.
+"""Unit tests for the VRAM_MB reservation reported by ``get_cluster_state``.
 
 Drives the plain class behind the Ray actor decorator with stubbed node
 resources, so the VRAM_MB branch is exercised without a GPU cluster.
