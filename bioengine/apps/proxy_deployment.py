@@ -332,6 +332,30 @@ class ProxyDeployment:
         # Lock for service registration
         self._registration_lock = asyncio.Lock()
 
+        # No Hypha service exists until _register_services succeeds, so seed the
+        # worker-visible record as unregistered rather than leaving it unknown.
+        self._proxy_actor_handle = proxy_actor_handle
+        self._report_service_registration(False)
+
+    def _report_service_registration(self, registered: bool) -> None:
+        """Tell the proxy actor whether our Hypha services exist right now.
+
+        Fire-and-forget: the worker reads this to decide whether to advertise
+        this app's service address, and a failed report must never affect the
+        replica.
+        """
+        if self._proxy_actor_handle is None:
+            return
+        try:
+            self._proxy_actor_handle.report_service_registration.remote(
+                application_id=self.application_id, registered=registered
+            )
+        except Exception as e:
+            logger.warning(
+                f"⚠️ Could not report service registration state for "
+                f"'{self.application_id}': {e}"
+            )
+
     async def get_app_data(self) -> Dict[str, Any]:
         """Return non-secret application metadata used for worker recovery."""
         return self.app_data
@@ -965,6 +989,7 @@ class ProxyDeployment:
         self._ice_expires_at = None
         # Reset so the next successful entry health check triggers re-registration
         self.entry_deployment_ready = False
+        self._report_service_registration(False)
 
     async def _reset_server_connection(self) -> None:
         """Cleanly disconnect ``self.server`` before we forget about it.
@@ -1228,6 +1253,7 @@ class ProxyDeployment:
                     self._connection_lost = False
                     self._probe_due_at = time.time() + _REACHABILITY_PROBE_INTERVAL_S
                     self._next_register_at = 0.0
+                    self._report_service_registration(True)
                 except Exception as e:
                     if self._is_permanent_registration_error(e):
                         logger.error(
