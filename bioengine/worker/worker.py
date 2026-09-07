@@ -21,6 +21,7 @@ from bioengine.utils import (
     fetch_centroid_coordinates,
     fetch_geolocation,
     check_permissions,
+    connect_with_retry,
     create_context,
     create_logger,
 )
@@ -559,13 +560,17 @@ class BioEngineWorker:
                 self.logger.error(f"Error closing Hypha server connection: {e}")
 
         self.logger.info(f"Connecting to Hypha server at '{self.server_url}'...")
-        self.server = await connect_to_server(
-            {
-                "server_url": self.server_url,
-                "token": self._token,
-                "workspace": self.workspace,
-                "client_id": self.client_id,
-            }
+        self.server = await connect_with_retry(
+            lambda: connect_to_server(
+                {
+                    "server_url": self.server_url,
+                    "token": self._token,
+                    "workspace": self.workspace,
+                    "client_id": self.client_id,
+                }
+            ),
+            description=f"Connection to Hypha server at '{self.server_url}'",
+            logger=self.logger,
         )
 
         # Check if provided token has admin permission level to generate new tokens
@@ -744,6 +749,7 @@ class BioEngineWorker:
         # letting stop_all_apps unregister cleanly first is just hygiene.
         ray_mode = getattr(getattr(self, "ray_cluster", None), "mode", None)
         if hasattr(self, "apps_manager") and self.apps_manager:
+            self.apps_manager.cancel_startup_retry()
             if ray_mode == "external-cluster":
                 self.logger.info(
                     "External-cluster mode: leaving deployed apps in place on the "

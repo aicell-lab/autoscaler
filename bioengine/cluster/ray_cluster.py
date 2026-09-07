@@ -20,6 +20,7 @@ from bioengine.cluster.proxy_actor import BioEngineProxyActor
 from bioengine.cluster.slurm_workers import SlurmWorkers
 from bioengine.utils import (
     acquire_free_port,
+    connect_with_retry,
     create_logger,
     date_format,
     get_internal_ip,
@@ -904,14 +905,18 @@ class RayCluster:
         try:
             # bootstrap.py references this upload via a content-hashed GCS URI
             # in every replica's py_modules; required in all cluster modes.
-            context = await asyncio.to_thread(
-                ray.init,
-                address=self.address,
-                namespace="bioengine",
-                logging_format=stream_logging_format,
-                runtime_env={
-                    "py_modules": [os.path.dirname(bioengine.__file__)],
-                },
+            context = await connect_with_retry(
+                lambda: asyncio.to_thread(
+                    ray.init,
+                    address=self.address,
+                    namespace="bioengine",
+                    logging_format=stream_logging_format,
+                    runtime_env={
+                        "py_modules": [os.path.dirname(bioengine.__file__)],
+                    },
+                ),
+                description=f"Connection to Ray cluster at '{self.address}'",
+                logger=self.logger,
             )
 
             # Update Ray's logger formatters to use timezone-aware date format
