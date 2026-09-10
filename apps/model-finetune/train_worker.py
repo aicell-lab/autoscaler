@@ -41,13 +41,16 @@ def _heartbeat(session_id: str, stop: threading.Event, interval: float = 60.0) -
     """Refresh status.json's ``updated_at`` while train_sam runs, so a long epoch
     doesn't trip the stale-window check (get_status marks TRAINING → STOPPED after
     STATUS_STALE_SECONDS of no update). Also persists n_epochs_completed so a
-    killed child still leaves its last-known count. train_sam has no per-step
-    callback here.
+    killed child still leaves its last-known count. Carries no ``status``: a
+    field-only write lands even under a sticky terminal record, so ``updated_at``
+    keeps advancing while a bystander's premature terminal is standing — a live
+    orphan stays visibly live instead of reading as dead. train_sam has no
+    per-step callback here.
     """
     while not stop.wait(interval):
         n = _epochs_completed(session_id)
-        extra = {"n_epochs_completed": n} if n is not None else {}
-        training.write_status(session_id, status="TRAINING", message="training in progress", **extra)
+        extra = {"n_epochs_completed": n, "n_epochs_completed_basis": "measured"} if n is not None else {}
+        training.write_status(session_id, **extra)
 
 
 def main(session_id: str) -> None:
@@ -96,6 +99,7 @@ def main(session_id: str) -> None:
             message="checkpoint saved" if ok else "training finished but no checkpoint was produced",
             end_time=time.time(), terminated_by="child",
             n_epochs_completed=_epochs_completed(session_id),
+            n_epochs_completed_basis="measured",
         )
     except Exception as e:
         stop.set()
