@@ -702,11 +702,13 @@ class EntryApp:
                     session_id=session_id, model_type=model_type, params=params
                 )
         except asyncio.CancelledError:
-            training.write_status(session_id, status="STOPPED", message="training task cancelled")
+            training.write_status(session_id, status="STOPPED",
+                                   message="training task cancelled", terminated_by="user_stop")
             raise
         except Exception as e:
             logger.error(f"Training session {session_id} failed: {e}")
-            training.write_status(session_id, status="FAILED", message=str(e)[:800])
+            training.write_status(session_id, status="FAILED",
+                                   message=str(e)[:800], terminated_by="entry")
         finally:
             self._training_tasks.pop(session_id, None)
 
@@ -903,7 +905,8 @@ class EntryApp:
         task = self._training_tasks.get(session_id)
         if task is not None and not task.done():
             task.cancel()
-        training.write_status(session_id, status="STOPPED", message="stop requested by user")
+        training.write_status(session_id, status="STOPPED",
+                               message="stop requested by user", terminated_by="user_stop")
         return training.get_status(session_id)
 
     @bioengine.method

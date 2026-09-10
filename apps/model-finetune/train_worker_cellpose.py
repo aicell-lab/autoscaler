@@ -73,17 +73,22 @@ def main(session_id: str) -> None:
         )
         stop.set()
         ok = training.checkpoint_path(session_id).exists()
+        # train_seg has no early stopping and only checkpoints after the full
+        # range(n_epochs) loop, so a COMPLETED cellpose run ran exactly the
+        # requested epochs; a truncated run never checkpoints → never COMPLETED.
         training.write_status(
             session_id,
             status="COMPLETED" if ok else "FAILED",
             message="checkpoint saved" if ok else "training finished but no checkpoint was produced",
-            end_time=time.time(),
+            end_time=time.time(), terminated_by="child",
+            n_epochs_completed=p["n_epochs"] if ok else None,
         )
     except Exception as e:
         stop.set()
         training.write_status(
             session_id, status="FAILED", message=str(e)[:800],
             traceback=traceback.format_exc()[-2500:], end_time=time.time(),
+            terminated_by="child",
         )
         raise
 
