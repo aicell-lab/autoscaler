@@ -29,8 +29,32 @@ import yaml
 from hypha_rpc import connect_to_server
 from pydantic import Field
 
-from runtime import RuntimeApp
-from runtime_cellpose import CellposeRuntime
+
+def _parse_backends(raw: Optional[str]) -> set:
+    """Backends this worker deploys, from ``MODEL_FINETUNE_BACKENDS`` (comma list
+    over ``microsam``/``cellpose``); unset or empty → both. A disabled backend's
+    runtime class is left ``None`` so its ``EntryApp.__init__`` annotation resolves
+    to ``None`` at introspection — the composition graph drops it, so it reserves
+    no GPU and never builds its pip env."""
+    if not raw or not raw.strip():
+        return {"microsam", "cellpose"}
+    picked = {b.strip().lower() for b in raw.split(",") if b.strip()}
+    unknown = picked - {"microsam", "cellpose"}
+    if unknown:
+        raise ValueError(
+            f"MODEL_FINETUNE_BACKENDS: unknown backend(s) {sorted(unknown)}; "
+            "valid values are 'microsam' and 'cellpose'."
+        )
+    return picked
+
+
+_ENABLED_BACKENDS = _parse_backends(os.getenv("MODEL_FINETUNE_BACKENDS"))
+RuntimeApp = None
+CellposeRuntime = None
+if "microsam" in _ENABLED_BACKENDS:
+    from runtime import RuntimeApp
+if "cellpose" in _ENABLED_BACKENDS:
+    from runtime_cellpose import CellposeRuntime
 
 logger = bioengine.logger
 
@@ -90,11 +114,14 @@ class EntryApp:
 
     def __init__(
         self,
-        runtime: RuntimeApp,
-        cellpose_runtime: CellposeRuntime,
+        runtime: RuntimeApp = None,
+        cellpose_runtime: CellposeRuntime = None,
         declared_gpu_memory_mb: Optional[int] = None,
         declared_gpu_device: Optional[str] = None,
     ) -> None:
+        # A backend disabled via MODEL_FINETUNE_BACKENDS is not composed, so its
+        # handle arrives as None; routing/capability methods reject it by name.
+        self._enabled_backends = set(_ENABLED_BACKENDS)
         self.runtime = runtime
         self.cellpose_runtime = cellpose_runtime
         # Deploy-time declared GPU VRAM (via deploy_app application_kwargs). When
@@ -140,8 +167,19 @@ class EntryApp:
 
     def _runtime_for(self, model_type: Optional[str]):
         """Route to the backend that owns ``model_type`` (cpsam → CellposeRuntime,
-        vit_* / None → micro-sam RuntimeApp)."""
-        return self.cellpose_runtime if model_type in CELLPOSE_MODEL_TYPES else self.runtime
+        vit_* / None → micro-sam RuntimeApp). Raises if that backend is not
+        deployed on this worker — the single choke point every serving/training
+        path funnels through, so one guard here rejects a disabled backend
+        everywhere (all direct ``self.runtime`` uses are gated by a prior
+        ``_check_runtime_available``, which routes through here)."""
+        backend = "cellpose" if model_type in CELLPOSE_MODEL_TYPES else "microsam"
+        if backend not in self._enabled_backends:
+            raise ValueError(
+                f"The '{backend}' backend is not deployed on this worker "
+                f"(MODEL_FINETUNE_BACKENDS={','.join(sorted(self._enabled_backends))}); "
+                f"model_type '{model_type}' is unavailable here."
+            )
+        return self.cellpose_runtime if backend == "cellpose" else self.runtime
 
     async def _check_runtime_available(self, model_type: Optional[str] = None) -> None:
         runtime = self._runtime_for(model_type)
@@ -679,23 +717,28 @@ class EntryApp:
         the hardware can't train. Returns VRAM per backend and, for all model
         types, ``{model_type, backend, min_gpu_memory_mb, family, size, trainable,
         reason, source}``. ``source`` is ``declared`` (deploy-time config, answered
-        CPU-side without waking a GPU), ``detected`` (live runtime probe), or
-        ``unavailable`` (backend runtime down → ``trainable`` is None)."""
+        CPU-side without waking a GPU), ``detected`` (live runtime probe),
+        ``unavailable`` (backend runtime down → ``trainable`` is None), or
+        ``disabled`` (backend not deployed on this worker → ``trainable`` is
+        False)."""
         import training
 
-        microsam = await self._gpu_view("microsam")
-        cellpose = await self._gpu_view("cellpose")
+        microsam = await self._gpu_view("microsam") if "microsam" in self._enabled_backends else {}
+        cellpose = await self._gpu_view("cellpose") if "cellpose" in self._enabled_backends else {}
         models = []
         for m in ModelType.__args__:
             backend = "cellpose" if m in CELLPOSE_MODEL_TYPES else "microsam"
+            enabled = backend in self._enabled_backends
             gpu = cellpose if backend == "cellpose" else microsam
             required = training.min_training_vram_mb(m)
             rec = {
                 "model_type": m, "backend": backend, "min_gpu_memory_mb": required,
                 "family": training.model_family(m), "size": training.model_size(m),
-                "source": gpu.get("source", "unavailable") if gpu else "unavailable",
+                "source": "disabled" if not enabled else (gpu.get("source", "unavailable") if gpu else "unavailable"),
             }
-            if not gpu:
+            if not enabled:
+                rec["trainable"], rec["reason"] = False, "backend not deployed on this worker"
+            elif not gpu:
                 rec["trainable"], rec["reason"] = None, "runtime unavailable"
             elif not gpu.get("available"):
                 rec["trainable"], rec["reason"] = False, "no GPU detected on the runtime"
@@ -706,7 +749,10 @@ class EntryApp:
                 rec["trainable"], rec["reason"] = True, "fits"
             models.append(rec)
         return {
-            "gpus": {"microsam": microsam, "cellpose": cellpose},
+            "gpus": {
+                "microsam": microsam if "microsam" in self._enabled_backends else {"enabled": False},
+                "cellpose": cellpose if "cellpose" in self._enabled_backends else {"enabled": False},
+            },
             "models": models,
             "parameters": self._training_parameter_schema(),
         }
