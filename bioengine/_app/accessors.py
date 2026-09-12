@@ -1,4 +1,4 @@
-"""Lazy process-local singletons exposed as ``bioengine.datasets`` / ``bioengine.logger``.
+"""Lazy accessors exposed as ``bioengine.datasets`` / ``bioengine.logger``.
 
 These are reached via the PEP 562 ``__getattr__`` on the ``bioengine`` package.
 Each Ray Serve replica is its own process, so a process-global cache is the
@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from bioengine._app.errors import MissingDataServerError
 
@@ -85,6 +85,33 @@ def _get_logger() -> logging.Logger:
 
         logger = create_logger("bioengine.app")
     return logger
+
+
+class _LazyLogger:
+    """Forwards every attribute to ``_get_logger()`` at the moment it is used.
+
+    ``bioengine.logger`` cannot hand out a concrete ``Logger``: Ray ships a
+    deployment class to its replica *by value*, so the user's module is imported
+    in the build task and the replica never re-imports it. A module-scope
+    ``logger = bioengine.logger`` would therefore keep the build task's logger,
+    whose handler writes into a process that is gone by the time the replica
+    logs — the records vanish. Resolving per call makes the placement of that
+    assignment irrelevant.
+    """
+
+    __slots__ = ()
+
+    def __getattr__(self, name: str) -> Any:
+        if name.startswith("__") and name.endswith("__"):
+            raise AttributeError(name)
+        return getattr(_get_logger(), name)
+
+    def __reduce__(self):
+        # Must pickle as the proxy; resolving here would re-freeze the logger.
+        return (_LazyLogger, ())
+
+    def __repr__(self) -> str:
+        return f"<bioengine.logger → {_get_logger().name}>"
 
 
 def _reset_for_tests() -> None:

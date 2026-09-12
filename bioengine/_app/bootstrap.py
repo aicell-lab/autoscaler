@@ -494,11 +494,11 @@ def build_and_run_application(
         os.environ[key] = value
 
     # ``_setup_replica`` also sets this, but only once the user's ``__init__``
-    # is already running — far too late for a module-scope ``bioengine.logger``,
-    # which is evaluated during the import inside ``cloudpickle.loads``. Putting
-    # it in the replica's runtime_env makes it true from the replica's first
-    # line. Deliberately added after the loop above: this build task is not
-    # itself a replica.
+    # is already running, so anything the replica logs before then took the
+    # fallback branch. In the runtime_env it is true from the replica's first
+    # line. Deliberately added after the loop above: this build task imports
+    # the user module but is not itself a replica, and claiming otherwise
+    # would be a lie the accessor believes.
     replica_env_vars = {**replica_env_vars, "BIOENGINE_REPLICA": "1"}
 
     head_app_dir = Path(replica_env_vars["BIOENGINE_APP_DIR"])
