@@ -77,6 +77,8 @@ def _make_manager(*, replicas: dict, registered) -> AppsManager:
     manager = object.__new__(AppsManager)
     manager.logger = logging.getLogger("test")
     manager._deployed_applications = {APP_ID: _make_app_info()}
+    # Not a startup application; the status path consults this list.
+    manager.startup_applications = []
 
     server = MagicMock()
     server.config.workspace = "bioimage-io"
