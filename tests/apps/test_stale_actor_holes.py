@@ -61,6 +61,10 @@ def _make_manager(*, built_app=_built_app(), source_signature=SIGNATURE) -> Apps
     manager.logger = logging.getLogger("test.holes")
     manager._redeploy_backoff = {}
     manager._identity_warned = set()
+    # Bookkeeping the monitor keeps for its other branches; empty is the
+    # nothing-pending state these tests want.
+    manager._missing_from_status = {}
+    manager._deleted_pending_redeploy = set()
     manager._deployed_applications = {
         APP_ID: {
             "is_deployed": is_deployed,
@@ -202,13 +206,13 @@ async def test_an_app_from_an_older_worker_has_no_signature_to_compare() -> None
 # ───────────────────── hole 3: what the monitor does about it ─────────────────────
 
 
-def _running_status():
+def _status(state: str = "RUNNING"):
     return SimpleNamespace(
-        applications={APP_ID: SimpleNamespace(status=SimpleNamespace(value="RUNNING"))}
+        applications={APP_ID: SimpleNamespace(status=SimpleNamespace(value=state))}
     )
 
 
-def _wire_monitor(manager: AppsManager, verdict: tuple) -> list:
+def _wire_monitor(manager: AppsManager, verdict: tuple, state: str = "RUNNING") -> list:
     """Route serve.status through call_with_reconnect; record serve.delete calls."""
     deletes: list = []
 
@@ -217,7 +221,7 @@ def _wire_monitor(manager: AppsManager, verdict: tuple) -> list:
         if name == "delete":
             deletes.append(args[0])
             return None
-        return _running_status()
+        return _status(state)
 
     manager.ray_cluster.call_with_reconnect = AsyncMock(side_effect=call_with_reconnect)
     manager._verify_running_identities = AsyncMock(return_value=verdict)
@@ -307,9 +311,10 @@ async def test_a_recovered_app_is_never_auto_redeployed(caplog) -> None:
     # _deploy_application would only raise on the None built_app; say so once
     # per attempt instead of scheduling a task that cannot succeed.
     manager = _make_manager(built_app=None)
+    _wire_monitor(manager, (None, None, None), state="UNHEALTHY")
 
     with caplog.at_level(logging.WARNING, logger="test.holes"):
-        manager._fire_redeploy(APP_ID, manager._deployed_applications[APP_ID], attempt=1)
+        await manager.monitor_applications()
         await asyncio.sleep(0)
 
     manager._deploy_application.assert_not_awaited()
