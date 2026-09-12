@@ -150,6 +150,13 @@ class BioEngineProxyActor:
             str, Dict[str, Dict[str, Dict[str, Optional[str]]]]
         ] = {}
 
+        # Whether each application's ProxyDeployment currently has its Hypha
+        # services registered, pushed by the proxy replica itself. A missing
+        # entry means "never reported", which is not the same as False — an app
+        # that predates this actor keeps serving without ever reporting here.
+        # Structure: {app_id: bool}
+        self.service_registrations: Dict[str, bool] = {}
+
         self._cached_geo_location: Optional[Dict[str, Optional[Union[str, float]]]] = None
 
         # Last successful per-node GPU memory read from the Ray dashboard. The
@@ -825,9 +832,37 @@ class BioEngineProxyActor:
         """
         self.application_replicas.pop(application_id, None)
         self.replica_identities.pop(application_id, None)
+        self.service_registrations.pop(application_id, None)
         logger.info(
             f"Cleared all registered replicas for application '{application_id}'."
         )
+
+    @_touch_on_call
+    def report_service_registration(
+        self, application_id: str, registered: bool
+    ) -> None:
+        """Record whether an application's Hypha services exist right now.
+
+        Pushed by ``ProxyDeployment``: False at replica init, True once
+        ``_register_services`` succeeds, False again on deregistration. The
+        worker reads it before advertising the app's service address, so a
+        client is never handed an id that nothing answers yet.
+        """
+        self.service_registrations[application_id] = registered
+        logger.info(
+            f"Application '{application_id}' reported its Hypha services as "
+            f"{'registered' if registered else 'not registered'}."
+        )
+
+    @_touch_on_call
+    def get_service_registration(self, application_id: str) -> Optional[bool]:
+        """Last reported Hypha registration state, or None if never reported.
+
+        None is not False: an app whose proxy replica started before this actor
+        existed — a different BioEngine version, or an actor recreated after
+        eviction — serves perfectly well without ever reporting here.
+        """
+        return self.service_registrations.get(application_id)
 
     @_touch_on_call
     def get_replica_identities(
