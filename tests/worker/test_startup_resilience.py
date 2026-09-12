@@ -165,6 +165,9 @@ def _startup_manager(startup_applications, deploy_app):
         admin_users=["admin@example.com"],
         deploy_app=deploy_app,
         _startup_retry_task=None,
+        # Reporting-only helpers the startup path calls for their side effects.
+        # Absorbed here so this test stays about retry, not about them.
+        _warn_on_startup_pin_divergence=lambda _app_config: None,
     )
     manager._retry_startup_applications = (
         lambda configs: AppsManager._retry_startup_applications(manager, configs)
