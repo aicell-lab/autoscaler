@@ -342,7 +342,7 @@ class BioEngineProxyActor:
         """
         for resource_name in resources:
             if resource_name.startswith("accelerator_type:"):
-                return resource_name.lstrip("accelerator_type:")
+                return resource_name.removeprefix("accelerator_type:")
 
     def _get_slurm_job_id(self, resources: Dict[str, float]) -> Optional[str]:
         """Extract the SLURM job ID from a node's resource dictionary.
