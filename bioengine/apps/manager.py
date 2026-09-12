@@ -2130,6 +2130,60 @@ class AppsManager:
             f"Successfully deleted version '{version}' of artifact '{artifact_id}'."
         )
 
+    async def _get_latest_artifact_version(self, artifact_id: str) -> Optional[str]:
+        """The artifact's newest committed version, or None if it can't be read.
+
+        Only used to report a stale inherited version, so a failure here must
+        never block the deploy that is asking.
+        """
+        try:
+            artifact = await self.artifact_manager.read(artifact_id)
+        except Exception as e:
+            self.logger.debug(
+                f"Could not read versions of artifact '{artifact_id}': {e}"
+            )
+            return None
+
+        versions = artifact.get("versions") or []
+        if not versions:
+            return None
+        return max(versions, key=lambda v: v["created_at"])["version"]
+
+    async def _report_inherited_version(
+        self, application_id: str, artifact_id: str, version: Optional[str]
+    ) -> None:
+        """Announce a version that was inherited from the running app, not requested.
+
+        An update without an explicit ``version`` redeploys whatever is already
+        running, so a caller who has just uploaded newer code gets a successful
+        deploy of the old one and nothing anywhere that says so. Pinning to an
+        older version stays legal — it just stops being silent.
+        """
+        if version is None:
+            # The running app was itself deployed as "latest", so this update
+            # resolves latest again and does roll forward.
+            self.logger.info(
+                f"Updating application '{application_id}' without a version; the "
+                f"running app is unpinned, so the latest version of "
+                f"'{artifact_id}' will be deployed."
+            )
+            return
+
+        latest_version = await self._get_latest_artifact_version(artifact_id)
+        if latest_version and latest_version != version:
+            self.logger.warning(
+                f"Updating application '{application_id}' without a version: "
+                f"keeping the running version {version!r}, but artifact "
+                f"'{artifact_id}' now has {latest_version!r}. This redeploys the "
+                f"code that is already running — pass version='{latest_version}' "
+                f"to roll forward."
+            )
+        else:
+            self.logger.info(
+                f"Updating application '{application_id}' without a version: "
+                f"keeping the running version {version!r}."
+            )
+
     @schema_method
     async def deploy_app(
         self,
@@ -2297,6 +2351,7 @@ class AppsManager:
                 last_updated_at = time.time()  # Update time for updates
 
                 # Inherit previous parameters if not specified
+                version_inherited = version is None
                 if version is None:
                     version = existing_app["version"]
                 if application_kwargs is None:
@@ -2323,6 +2378,11 @@ class AppsManager:
                 # (same pattern as the other update-inheritance fields above).
                 if scaling is None:
                     scaling = dict(existing_app.get("scaling") or {})
+
+                if version_inherited:
+                    await self._report_inherited_version(
+                        application_id, artifact_id, version
+                    )
             else:
                 # For new applications, set creation time and default values
                 started_at = time.time()
