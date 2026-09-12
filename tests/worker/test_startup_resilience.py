@@ -43,6 +43,27 @@ def test_connection_failures_are_transient_but_auth_failures_are_not():
     )
 
 
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Authentication error: Error decoding token headers.",
+        "Failed to establish connection: Failed to authenticate user: Current "
+        "workspace encoded in the token (ws-a) does not match the specified "
+        "workspace (ws-b)",
+        "Failed to establish connection: Client already exists and is active: "
+        "ws-a/some-worker",
+    ],
+)
+def test_hypha_rejections_fail_fast_despite_being_connection_errors(message):
+    """The rejections hypha_rpc actually raises, verbatim.
+
+    Every one arrives as ConnectionAbortedError, so classifying on the
+    exception type alone retries a token that will never work for the whole
+    budget. Measured against hypha.aicell.io with hypha-rpc 0.21.x.
+    """
+    assert not is_transient_connect_error(ConnectionAbortedError(message))
+
+
 async def test_retries_a_refused_connection_until_it_succeeds():
     attempts = []
 

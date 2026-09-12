@@ -9,6 +9,17 @@ from typing import Awaitable, Callable, List, Optional, Tuple, TypeVar
 
 T = TypeVar("T")
 
+# Message fragments of deterministic rejections. hypha_rpc raises every connect
+# failure as ConnectionAbortedError — a bad token, a mismatched workspace and a
+# client id already in use all arrive as ConnectionError subclasses — so the
+# isinstance test below cannot tell them from a refused socket. Measured against
+# hypha.aicell.io with hypha-rpc 0.21.x.
+_FATAL_CONNECT_MARKERS = (
+    "authentication error",
+    "failed to authenticate",
+    "client already exists",
+)
+
 # Message fragments of connection-level failures that are not raised as an
 # OSError subclass: a server that is up but not yet serving (503), and the Ray
 # client's own connect timeout.
@@ -30,11 +41,14 @@ def is_transient_connect_error(error: BaseException) -> bool:
 
     Authentication, permission and configuration errors are deterministic —
     retrying them only delays the same failure — so anything not recognised
-    here is treated as fatal.
+    here is treated as fatal. The fatal markers are checked first because the
+    exception type alone does not separate the two cases.
     """
+    message = str(error).lower()
+    if any(marker in message for marker in _FATAL_CONNECT_MARKERS):
+        return False
     if isinstance(error, (ConnectionError, TimeoutError, socket.gaierror)):
         return True
-    message = str(error).lower()
     return any(marker in message for marker in _TRANSIENT_CONNECT_MARKERS)
 
 
