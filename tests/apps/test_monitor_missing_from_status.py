@@ -31,6 +31,8 @@ import pytest
 from bioengine.apps.manager import _MISSING_FROM_STATUS_TOLERANCE, AppsManager
 
 APP_ID = "model-runner"
+ENTRY = "ModelRunner"
+VERSION = "2.8.0"
 
 
 def _serve_status(state: str | None):
@@ -55,9 +57,11 @@ def _make_manager() -> AppsManager:
         APP_ID: {
             "is_deployed": is_deployed,
             "artifact_id": "bioimage-io/model-runner",
-            "version": "2.8.0",
+            "version": VERSION,
             "auto_redeploy": True,
-            "built_app": object(),
+            "built_app": SimpleNamespace(
+                spec={"entry_id": "cid0", "classes": {"cid0": {"qualname": ENTRY}}}
+            ),
             "deployment_task": None,
         }
     }
@@ -68,14 +72,34 @@ def _make_manager() -> AppsManager:
     ray_cluster.proxy_actor_handle.get_serve_instance_details.remote = AsyncMock(
         return_value={}
     )
+    ray_cluster.proxy_actor_handle.get_replica_identities.remote = AsyncMock(
+        return_value={}
+    )
     manager.ray_cluster = ray_cluster
+    manager._identity_warned = set()
 
     # Let the real _fire_redeploy run so its log line is under test; only the
-    # deploy coroutine it schedules is stubbed out.
+    # deploy coroutine it schedules is stubbed out. _verify_running_identities
+    # runs for real off the two stubs above — mocking its return value would
+    # pin this file to that method's tuple width, which a sibling change to the
+    # same monitor widens.
     manager._deploy_application = AsyncMock()
-    manager._verify_running_identities = AsyncMock(return_value=(None, None))
 
     return manager
+
+
+def _replica_running(version: str) -> tuple:
+    """Serve details + baked identities for one RUNNING entry replica."""
+    details = {
+        "applications": {
+            APP_ID: {
+                "deployments": {
+                    ENTRY: {"replicas": [{"replica_id": "r1", "state": "RUNNING"}]}
+                }
+            }
+        }
+    }
+    return details, {ENTRY: {"r1": {"version": version}}}
 
 
 async def _tick(manager: AppsManager, state: str | None) -> None:
@@ -188,7 +212,13 @@ async def test_a_deliberate_delete_skips_the_tolerance(caplog) -> None:
     # tolerance would triple the recovery latency of a path that is already
     # degraded.
     manager = _make_manager()
-    manager._verify_running_identities = AsyncMock(return_value=(None, False))
+    details, identities = _replica_running("2.7.0")
+    manager.ray_cluster.proxy_actor_handle.get_serve_instance_details.remote.return_value = (
+        details
+    )
+    manager.ray_cluster.proxy_actor_handle.get_replica_identities.remote.return_value = (
+        identities
+    )
 
     with caplog.at_level(logging.WARNING, logger="test.monitor"):
         await _tick(manager, "RUNNING")
